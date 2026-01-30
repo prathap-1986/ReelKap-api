@@ -120,9 +120,10 @@ async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks
         if video_file.state.name == "FAILED":
             raise HTTPException(status_code=500, detail="Gemini failed to process the video file.")
 
-        # 4. Analyze with Gemini 2.0 Flash
+        # 4. Analyze with Gemini 2.0 Flash Lite (Cheaper & Faster)
+        # Using "lite" model to save tokens and avoid rate limits
         model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash",
+            model_name="gemini-2.0-flash-lite-preview-02-05", 
             generation_config={"response_mime_type": "application/json"}
         )
 
@@ -172,8 +173,17 @@ async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks
             "status": "failed"
         })
         
+        # Cleanup
         if os.path.exists(video_filename):
             os.remove(video_filename)
+
+        # Handle Rate Limits Gracefully
+        if "429" in str(e):
+            raise HTTPException(
+                status_code=429, 
+                detail="Server is busy (Rate Limit Exceeded). Please try again in 30 seconds."
+            )
+        
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
