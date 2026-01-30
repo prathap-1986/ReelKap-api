@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 import google.generativeai as genai
 import subprocess
@@ -6,6 +6,8 @@ import os
 import uuid
 import time
 import json
+import logging
+from datetime import datetime
 
 # --- CONFIGURATION ---
 # In production, use environment variables!
@@ -13,8 +15,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Configure Gemini
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable not set")
-genai.configure(api_key=GEMINI_API_KEY)
+    # Warning instead of crash for local dev if key missing
+    print("WARNING: GEMINI_API_KEY not set")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# Configure Logging (JSON format for Analytics/Marketing)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("reelkap")
 
 app = FastAPI(title="Reel-to-Guide API")
 
@@ -41,10 +49,21 @@ def cleanup_file(path: str):
         os.remove(path)
         print(f"Deleted temp file: {path}")
 
+def get_platform(url: str) -> str:
+    if "instagram" in url: return "instagram"
+    if "tiktok" in url: return "tiktok"
+    if "youtube" in url or "youtu.be" in url: return "youtube"
+    return "other"
+
+def log_event(data: dict):
+    """Logs structured JSON event for downstream analytics (PostHog/Mixpanel)"""
+    # In a real setup, this would send data to Mixpanel/PostHog API directly.
+    # For now, we print JSON which cloud providers (Render/AWS) capture.
+    data["timestamp"] = datetime.utcnow().isoformat()
+    logger.info(json.dumps(data))
+
 def download_video(url: str, output_path: str):
     """Downloads video using yt-dlp."""
-    # NOTE: In production (AWS/Cloud), Instagram blocks data center IPs.
-    # You will need to add proxy arguments here: --proxy "http://user:pass@host:port"
     cmd = [
         "yt-dlp",
         url,
@@ -56,9 +75,6 @@ def download_video(url: str, output_path: str):
         "--no-warnings"
     ]
     
-    # Optional: If you have cookies.txt for auth
-    # cmd.extend(["--cookies", "cookies.txt"])
-
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
@@ -67,7 +83,7 @@ def download_video(url: str, output_path: str):
 # --- API ENDPOINTS ---
 
 @app.post("/analyze", response_model=GuideResponse)
-async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks):
+async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks, req: Request):
     """
     1. Receives Instagram/TikTok URL.
     2. Downloads video locally.
@@ -75,17 +91,25 @@ async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks
     4. Extracts steps.
     5. Returns structured JSON guide.
     """
+    start_time = time.time()
+    platform = get_platform(request.url)
     
     # 1. Generate temp filename
     video_filename = f"temp_{uuid.uuid4()}.mp4"
-    print(f"Processing URL: {request.url}")
+    
+    # Initial Event Log (User Attempt)
+    log_event({
+        "event": "analysis_started",
+        "url": request.url,
+        "platform": platform,
+        "client_ip": req.client.host if req.client else "unknown"
+    })
 
     try:
         # 2. Download
         download_video(request.url, video_filename)
         
         # 3. Upload to Gemini
-        print("Uploading to Gemini...")
         video_file = genai.upload_file(path=video_filename)
         
         # Wait for processing state
@@ -97,8 +121,6 @@ async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks
             raise HTTPException(status_code=500, detail="Gemini failed to process the video file.")
 
         # 4. Analyze with Gemini 2.0 Flash
-        # We use JSON mode for structured output suited for an app
-        print("Analyzing content...")
         model = genai.GenerativeModel(
             model_name="gemini-2.0-flash",
             generation_config={"response_mime_type": "application/json"}
@@ -121,18 +143,35 @@ async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks
         """
 
         response = model.generate_content([video_file, prompt])
-        
-        # Parse result
         result_json = json.loads(response.text)
         
-        # 5. Cleanup (Delete local video and remote Gemini file to save space/cost)
+        # 5. Cleanup
         background_tasks.add_task(cleanup_file, video_filename)
         background_tasks.add_task(genai.delete_file, video_file.name)
+
+        # Success Event Log (Marketing Gold: What content is popular?)
+        log_event({
+            "event": "analysis_completed",
+            "url": request.url,
+            "platform": platform,
+            "duration_sec": round(time.time() - start_time, 2),
+            "extracted_title": result_json.get("title", "Unknown"),
+            "extracted_topic": result_json.get("description", "")[:50] + "...",
+            "status": "success"
+        })
 
         return result_json
 
     except Exception as e:
-        # Cleanup even if we fail
+        # Failure Event Log (For debugging & churn prevention)
+        log_event({
+            "event": "analysis_failed",
+            "url": request.url,
+            "platform": platform,
+            "error": str(e),
+            "status": "failed"
+        })
+        
         if os.path.exists(video_filename):
             os.remove(video_filename)
         raise HTTPException(status_code=500, detail=str(e))
