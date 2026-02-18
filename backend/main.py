@@ -42,6 +42,28 @@ class GuideResponse(BaseModel):
     steps: list[Step]
     tips: list[str]
 
+class HookAnalysis(BaseModel):
+    type: str
+    script: str
+    why_it_worked: str
+    improvement: str
+
+class StructurePhase(BaseModel):
+    time: str
+    phase: str
+    action: str
+
+class RemixTemplate(BaseModel):
+    niche: str
+    script: str
+    visual_cues: list[str]
+
+class ViralAnalysisResponse(BaseModel):
+    viral_score: int
+    hook_analysis: HookAnalysis
+    structure_breakdown: list[StructurePhase]
+    remix_template: RemixTemplate
+
 # --- HELPER FUNCTIONS ---
 def cleanup_file(path: str):
     """Deletes a temporary file."""
@@ -184,6 +206,96 @@ async def analyze_video(request: VideoRequest, background_tasks: BackgroundTasks
                 detail="Server is busy (Rate Limit Exceeded). Please try again in 30 seconds."
             )
         
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/viral-analyze", response_model=ViralAnalysisResponse)
+async def viral_analyze_video(request: VideoRequest, background_tasks: BackgroundTasks, req: Request):
+    """
+    1. Receives Instagram/TikTok URL.
+    2. Downloads video locally.
+    3. Uploads to Gemini.
+    4. Extracts viral structure (Hook, Retention, CTA).
+    5. Returns structured JSON breakdown.
+    """
+    start_time = time.time()
+    platform = get_platform(request.url)
+    video_filename = f"temp_viral_{uuid.uuid4()}.mp4"
+    
+    log_event({
+        "event": "viral_analysis_started",
+        "url": request.url,
+        "platform": platform,
+        "client_ip": req.client.host if req.client else "unknown"
+    })
+
+    try:
+        download_video(request.url, video_filename)
+        video_file = genai.upload_file(path=video_filename)
+        
+        while video_file.state.name == "PROCESSING":
+            time.sleep(1)
+            video_file = genai.get_file(video_file.name)
+            
+        if video_file.state.name == "FAILED":
+            raise HTTPException(status_code=500, detail="Gemini failed to process the video file.")
+
+        model = genai.GenerativeModel(
+            model_name="gemini-2.0-flash", 
+            generation_config={"response_mime_type": "application/json"}
+        )
+
+        VIRAL_PROMPT = """
+        You are a Viral Content Analyst. Analyze this short video and deconstruct why it went viral.
+        Provide the output strictly in the following JSON format:
+
+        {
+          "viral_score": <number 0-100 based on hook strength and retention>,
+          "hook_analysis": {
+            "type": "<e.g. Pattern Interrupt, Visual Curiosity, Negative Hook>",
+            "script": "<The exact words spoken in the first 3 seconds>",
+            "why_it_worked": "<Psychological reason>",
+            "improvement": "<How to make it 10% better>"
+          },
+          "structure_breakdown": [
+            { "time": "<timestamp>", "phase": "<Hook/Value/CTA>", "action": "<What happens visually/audially>" }
+          ],
+          "remix_template": {
+            "niche": "<Suggest a different niche, e.g. Real Estate -> Coding>",
+            "script": "<A rewritten script using the same viral structure for the new niche>",
+            "visual_cues": [
+              "<Timestamp 1 description>",
+              "<Timestamp 2 description>"
+            ]
+          }
+        }
+        """
+
+        response = model.generate_content([video_file, VIRAL_PROMPT])
+        result_json = json.loads(response.text)
+        
+        background_tasks.add_task(cleanup_file, video_filename)
+        background_tasks.add_task(genai.delete_file, video_file.name)
+
+        log_event({
+            "event": "viral_analysis_completed",
+            "url": request.url,
+            "platform": platform,
+            "duration_sec": round(time.time() - start_time, 2),
+            "score": result_json.get("viral_score", 0),
+            "status": "success"
+        })
+
+        return result_json
+
+    except Exception as e:
+        log_event({
+            "event": "viral_analysis_failed",
+            "url": request.url,
+            "error": str(e),
+            "status": "failed"
+        })
+        if os.path.exists(video_filename):
+            os.remove(video_filename)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
